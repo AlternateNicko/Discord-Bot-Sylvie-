@@ -1291,7 +1291,7 @@ class App:
                     el = time.time() - t0
                     print(f"\rstep {it + 1}/{steps}  loss {loss_acc:.4f}  lr {lr_at(it):.2e}  "
                           f"{(it + 1) / el:.2f} it/s", end="", flush=True)
-                    self.save()
+                    self.save(presave=True)
                 if (it + 1) % max(1, eval_every) == 0 or it + 1 == steps:
                     ev = evaluate()
                     self.hist[stage].append((self.steps[stage], ev["train"], ev["val"]))
@@ -1578,11 +1578,12 @@ class App:
                 print(f"Could not write report: {e}")
 
     # ---- save / load --------------------------------------------------------
-    def save(self, path=None):
-        if self.model is None or self.tok is None:
+    def save(self, path=None, presave=False):
+        if self.model is None or self.tok is None or not presave:
             print("Nothing to save (need tokenizer and model)."); return
-        path = path or input(f"Save path [{self.save_path}]: ").strip() or self.save_path
-        self.save_path = path
+        path = path or "presave_model.pt" if presave else input(f"Save path [{self.save_path}]: ").strip() or self.save_path
+        if not presave:
+            self.save_path = path
         tmp = path + ".tmp"
         torch.save({"version": 2, "config": self.model.c, "model": self.model.state_dict(),
                     "merges": [list(m) for m in self.tok.merges], "added_tokens": list(self.tok.added),
