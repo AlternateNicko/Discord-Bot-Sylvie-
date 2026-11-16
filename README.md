@@ -3,4 +3,3 @@ Just an archived, not full release discord bot, I'm still training the AI so I c
 
 Model download (pytorch model)
 https://www.mediafire.com/file/4ych8ijo3sfp2z4/model.pt/file
-https://www.mediafire.com/file/g2nqm4j2bi7xytt/model.pt/file
