@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Discord bot that chats using the Sylvie LLM model in model.pt (uses the chat special tokens
-and system prompt from sylvie_llm.py; works best after Stage 2 instruction fine-tuning).
+Discord bot that chats using the Sylvie LLM model in model.pt (uses the chat special tokens,
+system prompt, sampling and llama.cpp-style repetition penalty settings from sylvie_llm.py;
+works best after Stage 2 instruction fine-tuning).
 
 Setup:
     pip install discord.py torch
@@ -63,8 +64,9 @@ def generate_reply(history, message):
     ids = chat_prompt_ids(tok, msgs, budget)
 
     out = []
+    # penalty_last_n / penalty_repeat / penalty_freq / penalty_present come from the model's settings
     for t in model.generate(ids, int(S["max_new_tokens"]), float(S["temperature"]),
-                            int(S["top_k"]), float(S["top_p"]), float(S["rep_penalty"]),
+                            int(S["top_k"]), float(S["top_p"]), **llm._penalty_kwargs(),
                             stop_ids=(tok.end_id, tok.eos_id), ban_ids=tuple(tok.role_ids.values())):
         if t in (tok.end_id, tok.eos_id):
             break
