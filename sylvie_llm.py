@@ -52,14 +52,10 @@ PRETOKEN = re.compile(r"'s|'t|'re|'ve|'m|'ll|'d| ?[A-Za-z]+| ?[0-9]+| ?[^\sA-Za-
 
 
 class ByteBPE:
-    """Ids 0-255 are raw bytes, then one id per learned merge, then the special tokens,
-    then any LEARNED tokens (whole pre-token chunks added later, see observe/promote).
-    Learned tokens are appended AFTER the specials so no existing id ever shifts."""
+    """Ids 0-255 are raw bytes, then one id per learned merge, then the special tokens."""
 
-    def __init__(self, merges=None, added=None):
+    def __init__(self, merges=None):
         self.merges = [tuple(m) for m in (merges or [])]
-        self.added = list(added or [])      # learned chunks, in id order
-        self.pending = Counter()            # fragmented chunks seen so far -> count
         self._build()
 
     def _build(self):
@@ -76,52 +72,12 @@ class ByteBPE:
         self.assistant_id = self.special_ids[ASSISTANT_TEXT]
         self.end_id = self.special_ids[END_TEXT]
         self.role_ids = {"system": self.system_id, "user": self.user_id, "assistant": self.assistant_id}
-        n_base = base + len(SPECIALS)
-        self.added_ids = {}
-        for j, chunk in enumerate(self.added):
-            self.added_ids[chunk] = n_base + j
-            self.vocab[n_base + j] = chunk.encode("utf-8")
-        self.vocab_size = n_base + len(self.added)
+        self.vocab_size = base + len(SPECIALS)
         self._cache = {}
-
-    # -- dynamic vocabulary ---------------------------------------------------
-    def observe(self, texts, min_pieces=3, max_chars=32):
-        """Count pre-token chunks that the BPE can only spell with >= min_pieces tiny pieces
-        (i.e. 'unfamiliar' words, names, symbols, emoji, rare scripts)."""
-        for t in texts:
-            for chunk in PRETOKEN.findall(t):
-                if chunk in self.added_ids or not chunk.strip() or len(chunk) > max_chars:
-                    continue
-                if len(self._encode_base(chunk)) >= min_pieces:
-                    self.pending[chunk] += 1
-        if len(self.pending) > 200000:      # keep memory bounded: forget one-offs
-            self.pending = Counter({k: v for k, v in self.pending.items() if v > 1})
-
-    def promote(self, min_count=2, limit=None):
-        """Turn frequently seen fragmented chunks into real tokens.
-        Returns [(chunk, new_id, old_piece_ids)] so the model can initialise the new embeddings."""
-        cands = sorted(((c, n) for c, n in self.pending.items() if n >= min_count), key=lambda x: -x[1])
-        if limit is not None:
-            cands = cands[:max(0, limit)]
-        new = []
-        for chunk, _ in cands:
-            if chunk in self.added_ids:
-                continue
-            pieces = list(self._encode_base(chunk))
-            tid = self.vocab_size
-            self.added.append(chunk)
-            self.added_ids[chunk] = tid
-            self.vocab[tid] = chunk.encode("utf-8")
-            self.vocab_size += 1
-            new.append((chunk, tid, pieces))
-        for chunk, _ in cands:
-            self.pending.pop(chunk, None)
-        return new
 
     # -- training -----------------------------------------------------------
     def train(self, texts, vocab_size, verbose=True):
         """texts: iterable of strings. Special tokens are never merged."""
-        self.added, self.pending = [], Counter()
         n_merges = max(0, vocab_size - 256 - len(SPECIALS))
         counts = Counter()
         for t in texts:
@@ -169,13 +125,6 @@ class ByteBPE:
 
     # -- encode / decode ----------------------------------------------------
     def _encode_chunk(self, chunk):
-        tid = self.added_ids.get(chunk)
-        if tid is not None:
-            return [tid]
-        return self._encode_base(chunk)
-
-    def _encode_base(self, chunk):
-        """Plain byte-level BPE (ignores learned tokens)."""
         hit = self._cache.get(chunk)
         if hit is not None:
             return hit
@@ -238,49 +187,27 @@ def with_system(messages, system_prompt):
     return list(messages)
 
 
-CONTEXT_LABEL = "Context:\n"    # plain text (no new special token), so old checkpoints keep working
-
-
-def encode_conversation(tok, messages, response_only=True, train_context=False):
+def encode_conversation(tok, messages, response_only=True):
     """
-    Turn [{'role','content'[, 'context']}, ...] into (ids, labels).
-    Layout per turn:  <|role|> [Context:\\n<context>] content-tokens <|end|>
-    A user message may carry an optional 'context' (e.g. its own CSV column): background the
-    model reads before the prompt. It is always part of the INPUT; it is only trained on
-    (loss) when train_context=True.
-    labels[i] is the token id the model should learn to produce at position i, or IGNORE.
-    With response_only=True only assistant content and its closing <|end|> are supervised
-    (plus the context tokens if train_context); everything else and every role token is masked.
+    Turn [{'role','content'}, ...] into (ids, labels).
+    Layout per turn:  <|role|> content-tokens <|end|>
+    labels[i] is the token id the model should learn to produce at position i,
+    or IGNORE. With response_only=True only assistant content and its closing
+    <|end|> are supervised; system/user turns and every role token are masked.
     The <|end|> after a reply IS supervised so the model learns when to stop.
     """
     ids, labels = [], []
     for m in messages:
         head = [tok.role_ids[m["role"]]]
-        text = str(m["content"]).strip()
-        ctx = str(m.get("context") or "").strip() if m["role"] == "user" else ""
-        if ctx:
-            ctx_ids = tok.encode(CONTEXT_LABEL + ctx, allow_special=False)
-            body = tok.encode("\n\n" + text, allow_special=False) + [tok.end_id]
-        else:
-            ctx_ids, body = [], tok.encode(text, allow_special=False) + [tok.end_id]
-        ids += head + ctx_ids + body
+        body = tok.encode(str(m["content"]).strip(), allow_special=False) + [tok.end_id]
+        ids += head + body
         if not response_only:
-            labels += head + ctx_ids + body
+            labels += head + body
         elif m["role"] == "assistant":
             labels += [IGNORE] * len(head) + body
         else:
-            labels += [IGNORE] * len(head) + (ctx_ids if train_context else [IGNORE] * len(ctx_ids)) \
-                + [IGNORE] * len(body)
+            labels += [IGNORE] * (len(head) + len(body))
     return ids, labels
-
-
-def conv_texts(convs):
-    """All message texts (content and context) of a list of conversations, e.g. for tokenizer/vocab scans."""
-    for c in convs:
-        for m in c:
-            yield m["content"]
-            if m.get("context"):
-                yield m["context"]
 
 
 def chat_prompt_ids(tok, messages, budget):
@@ -304,8 +231,7 @@ ROLE_TEXT = {"system": SYSTEM_TEXT, "user": USER_TEXT, "assistant": ASSISTANT_TE
 
 
 def render_conversation(messages):
-    return "".join(ROLE_TEXT[m["role"]] + (CONTEXT_LABEL + m["context"] + "\n\n" if m.get("context") else "")
-                   + m["content"] + END_TEXT for m in messages)
+    return "".join(ROLE_TEXT[m["role"]] + m["content"] + END_TEXT for m in messages)
 
 
 # ----------------------------------------------------------------------------
@@ -435,14 +361,6 @@ def _record_messages(obj, S):
         text = _content_text(content)
         if role and text:
             msgs.append({"role": role, "content": text})
-    # optional background context for the (first) user turn: explicit key, else a 'context' field
-    ctx = _join_keys(obj, S["json_context_key"]) if S["json_context_key"] else \
-        (_content_text(obj.get("context")) if isinstance(obj.get("context"), (str, list)) else "")
-    if ctx:
-        for m in msgs:
-            if m["role"] == "user":
-                m["context"] = ctx
-                break
     return msgs
 
 
@@ -515,18 +433,14 @@ def read_conversations(path, S):
             header = next(rd, [])
             pc = _resolve_cols(S["csv_prompt_col"], header)
             rc = _resolve_cols(S["csv_response_col"], header)
-            cc = _resolve_cols(S["csv_context_col"], header)      # optional
             if not (pc and rc):
                 raise ValueError("instruction CSVs need BOTH csv_prompt_col and csv_response_col "
                                  "(menu: 'Set up CSV / JSONL columns')")
             pick = lambda row, idx: "\n".join(row[i].strip() for i in idx if i < len(row) and row[i].strip())
             for row in rd:
-                p, r, c = pick(row, pc), pick(row, rc), pick(row, cc)
+                p, r = pick(row, pc), pick(row, rc)
                 if p and r:
-                    user = {"role": "user", "content": p}
-                    if c:
-                        user["context"] = c
-                    yield [user, {"role": "assistant", "content": r}]
+                    yield [{"role": "user", "content": p}, {"role": "assistant", "content": r}]
         finally:
             f.close()
     elif ext == ".jsonl":
@@ -711,7 +625,7 @@ def load_eval_file(path):
             ref = next((_content_text(obj[k]) for k in ("reference", "response", "output", "answer", "completion")
                         if _content_text(obj.get(k))), None)
             items.append({"prompt": prompt, "checks": _parse_checks(obj.get("checks") or obj.get("instructions")),
-                          "reference": ref, "context": _content_text(obj.get("context")) or None})
+                          "reference": ref})
     return items
 
 
@@ -867,31 +781,19 @@ class GPT(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
     @torch.no_grad()
-    def resize_vocab(self, new_size, inits=()):
-        """Grow the (tied) embedding / output head in place. New row j starts as the mean of the
-        embeddings of the pieces the token used to be spelled with, so it begins life meaning
-        roughly what its spelling already meant. Existing rows are untouched."""
-        old = self.tok.weight.shape[0]
-        if new_size <= old:
-            return
-        dev, dt = self.tok.weight.device, self.tok.weight.dtype
-        emb = nn.Embedding(new_size, self.c["n_embd"]).to(dev, dt)
-        nn.init.normal_(emb.weight, 0.0, 0.02)
-        emb.weight[:old] = self.tok.weight
-        for j, pieces in enumerate(inits):
-            if old + j < new_size and pieces:
-                emb.weight[old + j] = self.tok.weight[torch.tensor(pieces, device=dev)].mean(0)
-        self.tok = emb
-        self.head = nn.Linear(self.c["n_embd"], new_size, bias=False).to(dev, dt)
-        self.head.weight = self.tok.weight      # keep weight tying
-        self.c["vocab_size"] = new_size
-
-    @torch.no_grad()
-    def generate(self, ids, max_new, temperature=0.8, top_k=50, top_p=0.95, rep_penalty=1.1,
+    def generate(self, ids, max_new, temperature=0.8, top_k=50, top_p=0.95,
+                 penalty_last_n=64, penalty_repeat=1.1, penalty_freq=0.0, penalty_present=0.0,
                  stop_ids=(), ban_ids=()):
         """Generator yielding one new token id at a time. Stops after yielding a stop id.
-        ban_ids can never be sampled; stop/ban ids are exempt from the repetition penalty
-        (otherwise <|end|> gets harder to produce every turn)."""
+        ban_ids can never be sampled; stop/ban ids are exempt from every repetition penalty
+        (otherwise <|end|> gets harder to produce every turn).
+
+        Repetition penalties look at the last `penalty_last_n` tokens (prompt + generated so far):
+          penalty_last_n  : window size. 0 = penalties off, -1 = the model's whole context.
+          penalty_repeat  : multiplicative; >1 discourages any token already in the window (1.0 = off).
+          penalty_freq    : subtracted from a token's logit once per occurrence in the window (0 = off).
+          penalty_present : subtracted once from any token that occurs at all in the window (0 = off).
+        Order: repeat, then freq/present, then ban, then temperature/top-k/top-p."""
         self.eval()
         dev = next(self.parameters()).device
         idx = torch.tensor([ids], dtype=torch.long, device=dev)
@@ -899,15 +801,24 @@ class GPT(nn.Module):
         exempt = torch.tensor(list(stop_ids) + list(ban_ids), dtype=torch.long, device=dev) \
             if (stop_ids or ban_ids) else None
         stop = set(stop_ids)
+        n = int(penalty_last_n)
+        window = self.c["block_size"] if n < 0 else n
+        use_rep = bool(penalty_repeat) and penalty_repeat > 0 and penalty_repeat != 1.0
+        use_pen = window > 0 and (use_rep or bool(penalty_freq) or bool(penalty_present))
         for _ in range(max_new):
             logits = self(idx[:, -self.c["block_size"]:], last_only=True)[0][0, -1].float()
-            if rep_penalty and rep_penalty != 1.0:
-                seen = torch.unique(idx[0, -256:])
+            if use_pen:
+                counts = torch.bincount(idx[0, -window:], minlength=logits.numel())[:logits.numel()].float()
                 if exempt is not None:
-                    seen = seen[~torch.isin(seen, exempt)]
-                if seen.numel():
-                    l = logits[seen]
-                    logits[seen] = torch.where(l > 0, l / rep_penalty, l * rep_penalty)
+                    counts[exempt] = 0
+                seen = counts > 0
+                if use_rep:
+                    logits = torch.where(seen, torch.where(logits > 0, logits / penalty_repeat,
+                                                           logits * penalty_repeat), logits)
+                if penalty_freq:
+                    logits = logits - penalty_freq * counts
+                if penalty_present:
+                    logits = logits - penalty_present * seen.float()
             if ban is not None:
                 logits[ban] = -float("inf")
             if temperature <= 0:
@@ -978,9 +889,6 @@ DEFAULT_SETTINGS = {
     "n_layer": 6, "n_head": 6, "n_embd": 384, "block_size": 256, "dropout": 0.1,
     # tokenizer
     "vocab_size": 4000, "tok_train_chars": 5_000_000,
-    # dynamic vocabulary: unfamiliar chunks (spelled with >= vocab_min_pieces tiny pieces) become tokens
-    "auto_vocab": True, "vocab_min_pieces": 3, "vocab_min_count": 2, "vocab_chat_min_count": 1,
-    "vocab_max_added": 2000,
     # stage 1: pretraining (+ settings shared by both stages)
     "steps": 2000, "batch_size": 16, "grad_accum": 1, "lr": 3e-4, "min_lr": 3e-5,
     "warmup": 100, "weight_decay": 0.1, "grad_clip": 1.0, "eval_every": 250,
@@ -988,12 +896,12 @@ DEFAULT_SETTINGS = {
     # stage 2: instruction fine-tuning
     "sft_steps": 600, "sft_batch_size": 16, "sft_grad_accum": 1, "sft_lr": 1e-4, "sft_min_lr": 1e-5,
     "sft_warmup": 30, "sft_eval_every": 100, "sft_val_split": 0.05, "sft_response_only": True,
-    "sft_train_on_context": False,    # also put loss on the context column's tokens (it is always read as input)
     # data parsing
-    "csv_prompt_col": "", "csv_response_col": "", "csv_text_col": "", "csv_context_col": "",
-    "json_prompt_key": "", "json_response_key": "", "json_key": "", "json_context_key": "",
+    "csv_prompt_col": "", "csv_response_col": "", "csv_text_col": "",
+    "json_prompt_key": "", "json_response_key": "", "json_key": "",
     # generation / chat
-    "temperature": 0.8, "top_k": 50, "top_p": 0.95, "rep_penalty": 1.1, "max_new_tokens": 200,
+    "temperature": 0.8, "top_k": 50, "top_p": 0.95, "max_new_tokens": 200,
+    "penalty_last_n": 64, "penalty_repeat": 1.1, "penalty_freq": 0.0, "penalty_present": 0.0,
     "system_prompt": "",
     # evaluation
     "eval_file": "", "eval_max_new_tokens": 160, "eval_temperature": 0.0, "eval_show": 3,
@@ -1161,42 +1069,6 @@ class App:
         print(f"Done. Vocab size: {self.tok.vocab_size}. Round-trip: {'OK' if ok else 'FAILED'}. "
               f"Special tokens: {'OK' if ok2 else 'FAILED'}")
 
-    # ---- dynamic vocabulary -------------------------------------------------
-    def grow_vocab(self, texts, min_count, announce=True):
-        """Scan texts for unfamiliar chunks; add the ones seen >= min_count times as new tokens
-        and grow the model's embeddings to match. Returns the list of new (chunk, id, pieces)."""
-        S, tok = self.S, self.tok
-        if tok is None or not S["auto_vocab"]:
-            return []
-        room = int(S["vocab_max_added"]) - len(tok.added)
-        if room <= 0:
-            return []
-        tok.observe(texts, int(S["vocab_min_pieces"]))
-        new = tok.promote(int(min_count), room)
-        if new and self.model is not None:
-            self.model.resize_vocab(tok.vocab_size, [p for _, _, p in new])
-        if new and announce:
-            shown = ", ".join(repr(c) for c, _, _ in new[:8]) + (" ..." if len(new) > 8 else "")
-            print(f"  [vocab] learned {len(new)} new token(s): {shown}  (vocab now {tok.vocab_size})")
-        return new
-
-    def vocab_menu(self):
-        if self.tok is None:
-            print("No tokenizer yet."); return
-        tok = self.tok
-        print(f"Learned tokens: {len(tok.added)} / {self.S['vocab_max_added']}  "
-              f"(auto_vocab {'ON' if self.S['auto_vocab'] else 'OFF'}, vocab size {tok.vocab_size})")
-        for i, c in enumerate(tok.added[-40:], max(0, len(tok.added) - 40)):
-            print(f"  id {tok.added_ids[c]}: {c!r}")
-        if input("Scan loaded data files for unfamiliar tokens now? (y/N) ").lower() == "y":
-            mc = int(self.S["vocab_min_count"])
-            if self.pt_files:
-                self.grow_vocab(load_corpus(self.pt_files, self.S, read_text_documents), mc)
-            if self.sft_files:
-                convs = load_corpus(self.sft_files, self.S, read_conversations)
-                self.grow_vocab((m["content"] for c in convs for m in c), mc)
-            print(f"Learned tokens now: {len(tok.added)}")
-
     # ---- model --------------------------------------------------------------
     def build_model(self):
         if self.tok is None:
@@ -1291,7 +1163,6 @@ class App:
                     el = time.time() - t0
                     print(f"\rstep {it + 1}/{steps}  loss {loss_acc:.4f}  lr {lr_at(it):.2e}  "
                           f"{(it + 1) / el:.2f} it/s", end="", flush=True)
-                    self.save(presave=True)
                 if (it + 1) % max(1, eval_every) == 0 or it + 1 == steps:
                     ev = evaluate()
                     self.hist[stage].append((self.steps[stage], ev["train"], ev["val"]))
@@ -1308,7 +1179,6 @@ class App:
         if not docs:
             return None
         random.Random(1337).shuffle(docs)    # so the validation tail is not just the last file
-        self.grow_vocab(docs, int(self.S["vocab_min_count"]))   # before tokenizing, so new tokens are used
         ids = []
         for d in docs:
             ids.extend(self.tok.encode(d, allow_special=False))
@@ -1358,8 +1228,6 @@ class App:
             print("Reading and tokenizing instruction data...")
         convs = load_corpus(self.sft_files, S, read_conversations) if not quiet else \
             [c for p in self.sft_files for c in self._silent_read(p)]
-        if not quiet:
-            self.grow_vocab((m["content"] for c in convs for m in c), int(S["vocab_min_count"]))
         resp_only = bool(S["sft_response_only"])
         ex, trunc, dropped = [], 0, 0
         for msgs in convs:
@@ -1425,11 +1293,16 @@ class App:
             self.save()
 
     # ---- generation ---------------------------------------------------------
+    def _penalty_kwargs(self):
+        S = self.S
+        return dict(penalty_last_n=int(S["penalty_last_n"]), penalty_repeat=float(S["penalty_repeat"]),
+                    penalty_freq=float(S["penalty_freq"]), penalty_present=float(S["penalty_present"]))
+
     def _stream(self, prompt_ids, stop_ids, ban_ids=()):
         S = self.S
         out_ids, printed, text = [], "", ""
         gen = self.model.generate(prompt_ids, int(S["max_new_tokens"]), float(S["temperature"]),
-                                  int(S["top_k"]), float(S["top_p"]), float(S["rep_penalty"]),
+                                  int(S["top_k"]), float(S["top_p"]), **self._penalty_kwargs(),
                                   stop_ids=stop_ids, ban_ids=ban_ids)
         for t in gen:
             if t in stop_ids:
@@ -1450,7 +1323,7 @@ class App:
         S, tok = self.S, self.tok
         out, finished = [], False
         for t in self.model.generate(ids, max_new, temperature, int(S["top_k"]), float(S["top_p"]),
-                                     float(S["rep_penalty"]), stop_ids=(tok.end_id, tok.eos_id),
+                                     **self._penalty_kwargs(), stop_ids=(tok.end_id, tok.eos_id),
                                      ban_ids=tuple(tok.role_ids.values())):
             if t in (tok.end_id, tok.eos_id):
                 finished = True
@@ -1468,7 +1341,6 @@ class App:
         if not self._ready():
             return
         prompt = input("Prompt: ")
-        self.grow_vocab([prompt], int(self.S["vocab_chat_min_count"]))
         ids = self.tok.encode(prompt)[-self.model.c["block_size"]:] or [self.tok.eos_id]
         print(prompt, end="")
         try:
@@ -1482,7 +1354,7 @@ class App:
         S, tok = self.S, self.tok
         system = S["system_prompt"]
         hist = []
-        print("Chat started. Commands: /reset  /system <text>  /vocab  /quit   (Ctrl+C stops a reply)")
+        print("Chat started. Commands: /reset  /system <text>  /quit   (Ctrl+C stops a reply)")
         if self.stage != "sft":
             print("Note: this model has not been instruction-tuned yet (stage 2), so replies may be poor.")
         while True:
@@ -1498,10 +1370,6 @@ class App:
                 hist = []; print("[history cleared]"); continue
             if u.startswith("/system"):
                 system = u[7:].strip(); hist = []; print("[system prompt set, history cleared]"); continue
-            if u == "/vocab":
-                print(f"[{len(tok.added)} learned tokens; latest: "
-                      f"{', '.join(repr(c) for c in tok.added[-10:]) or 'none'}]"); continue
-            self.grow_vocab([u], int(S["vocab_chat_min_count"]))     # learn unfamiliar words on the spot
             hist.append({"role": "user", "content": u})
             budget = self.model.c["block_size"] - min(int(S["max_new_tokens"]), self.model.c["block_size"] // 2)
             ids = chat_prompt_ids(tok, with_system(hist, system), budget)
@@ -1578,16 +1446,14 @@ class App:
                 print(f"Could not write report: {e}")
 
     # ---- save / load --------------------------------------------------------
-    def save(self, path=None, presave=False):
-        if self.model is None or self.tok is None or not presave:
+    def save(self, path=None):
+        if self.model is None or self.tok is None:
             print("Nothing to save (need tokenizer and model)."); return
-        path = path or "presave_model.pt" if presave else input(f"Save path [{self.save_path}]: ").strip() or self.save_path
-        if not presave:
-            self.save_path = path
+        path = path or input(f"Save path [{self.save_path}]: ").strip() or self.save_path
+        self.save_path = path
         tmp = path + ".tmp"
         torch.save({"version": 2, "config": self.model.c, "model": self.model.state_dict(),
-                    "merges": [list(m) for m in self.tok.merges], "added_tokens": list(self.tok.added),
-                    "specials": SPECIALS, "settings": self.S,
+                    "merges": [list(m) for m in self.tok.merges], "specials": SPECIALS, "settings": self.S,
                     "stage": self.stage, "steps": self.steps, "history": self.hist, "eval_log": self.eval_log,
                     "pt_files": self.pt_files, "sft_files": self.sft_files}, tmp)
         os.replace(tmp, path)
@@ -1599,7 +1465,7 @@ class App:
             print("File not found."); return
         try:
             ck = torch.load(path, map_location=self.device, weights_only=False)
-            tok = ByteBPE(ck["merges"], ck.get("added_tokens"))
+            tok = ByteBPE(ck["merges"])
             cfg, sd = dict(ck["config"]), ck["model"]
             legacy = ck.get("version", 1) < 2
             if cfg["vocab_size"] != tok.vocab_size:
@@ -1619,7 +1485,10 @@ class App:
             model.load_state_dict(sd)
             model.eval()
             self.tok, self.model = tok, model
-            self.S.update({k: v for k, v in ck.get("settings", {}).items() if k in self.S})
+            saved = dict(ck.get("settings", {}))
+            if "rep_penalty" in saved and "penalty_repeat" not in saved:   # pre-penalty-options checkpoints
+                saved["penalty_repeat"] = saved["rep_penalty"]
+            self.S.update({k: v for k, v in saved.items() if k in self.S})
             for k in ARCH_KEYS:
                 self.S[k] = cfg[k]
             if legacy:
@@ -1647,8 +1516,7 @@ class App:
         print(f"Device          : {self.device}" + (f" ({torch.cuda.get_device_name(0)})" if self.device == "cuda" else ""))
         print(f"PyTorch         : {torch.__version__}")
         print("Tokenizer       : " + (f"byte-level BPE, vocab {self.tok.vocab_size} "
-                                      f"({len(self.tok.merges)} merges + {len(SPECIALS)} special + "
-                                      f"{len(self.tok.added)} learned)" if self.tok else "not trained"))
+                                      f"({len(self.tok.merges)} merges + {len(SPECIALS)} special)" if self.tok else "not trained"))
         if self.model:
             c = self.model.c
             print(f"Model           : GPT, {self.model.n_params() / 1e6:.2f}M params")
@@ -1673,8 +1541,6 @@ class App:
     def settings_menu(self):
         groups = [("Model architecture (new models only)", ("n_layer", "n_head", "n_embd", "block_size", "dropout")),
                   ("Tokenizer", ("vocab_size", "tok_train_chars")),
-                  ("Dynamic vocabulary (learn unfamiliar tokens automatically)",
-                   ("auto_vocab", "vocab_min_pieces", "vocab_min_count", "vocab_chat_min_count", "vocab_max_added")),
                   ("Stage 1 pretraining (weight_decay, grad_clip, eval_iters, mixed_precision are shared)",
                    ("steps", "batch_size", "grad_accum", "lr", "min_lr", "warmup", "weight_decay",
                     "grad_clip", "eval_every", "eval_iters", "val_split", "mixed_precision")),
@@ -1683,7 +1549,8 @@ class App:
                     "sft_eval_every", "sft_val_split", "sft_response_only")),
                   ("Data parsing (comma-separate several; CSV accepts names or 0-based numbers)",
                    ("csv_prompt_col", "csv_response_col", "csv_text_col", "json_prompt_key", "json_response_key", "json_key")),
-                  ("Generation / chat", ("temperature", "top_k", "top_p", "rep_penalty", "max_new_tokens", "system_prompt")),
+                  ("Generation / chat", ("temperature", "top_k", "top_p", "penalty_last_n", "penalty_repeat", "penalty_freq",
+                                         "penalty_present", "max_new_tokens", "system_prompt")),
                   ("Evaluation", ("eval_file", "eval_max_new_tokens", "eval_temperature", "eval_show", "eval_report"))]
         while True:
             print("\n=== SETTINGS ===")
@@ -1732,7 +1599,6 @@ def main():
         ("Set up CSV / JSONL prompt & response columns", app.column_setup),
         ("Preview data (shows which tokens are trained on)", app.preview),
         ("Train / retrain tokenizer (byte-level BPE + special tokens)", app.train_tokenizer),
-        ("Learned vocabulary (view / scan data for unfamiliar tokens)", app.vocab_menu),
         ("STAGE 1: Pretrain (raw text, loss on all tokens)", app.pretrain),
         ("STAGE 2: Instruction fine-tune (loss on responses only)", app.finetune),
         ("Evaluate instruction following", app.evaluate_instructions),
